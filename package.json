@@ -1,0 +1,14 @@
+{
+  "name": "pi-slack-ai",
+  "version": "1.0.0",
+  "description": "Ask Slack AI questions directly from pi — searches channels, DMs, Jira, Confluence, and more",
+  "keywords": ["pi-package"],
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "playwright": "^1.40.0",
+    "typebox": "^1.1.0"
+  }
+}
