@@ -9,13 +9,13 @@ Uses Playwright to control a headless Chromium browser that sends messages to Sl
 ## Install
 
 ```bash
-pi install git:github.com/jackrichards31/pi-slack-ai
+pi install git:github.com/jackwrichards/pi-slack-ai
 ```
 
 Then install the Chromium browser for Playwright:
 
 ```bash
-cd ~/.pi/agent/git/github.com/jackrichards31/pi-slack-ai
+cd ~/.pi/agent/git/github.com/jackwrichards/pi-slack-ai
 npx playwright install chromium
 ```
 
