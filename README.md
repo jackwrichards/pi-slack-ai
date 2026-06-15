@@ -9,13 +9,13 @@ Uses Playwright to control a headless Chromium browser that sends messages to Sl
 ## Install
 
 ```bash
-pi install git:github.com/jackwrichards/pi-slack-ai
+pi install git:github.com/<your-username>/pi-slack-ai
 ```
 
 Then install the Chromium browser for Playwright:
 
 ```bash
-cd ~/.pi/agent/git/github.com/jackwrichards/pi-slack-ai
+cd ~/.pi/agent/git/github.com/<your-username>/pi-slack-ai
 npx playwright install chromium
 ```
 
@@ -26,14 +26,14 @@ The first time the tool runs, it will ask you two things:
 ### 1. Workspace/Team ID
 
 1. Open Slack **in your browser** (not the desktop app)
-2. Look at the URL — it looks like: `https://app.slack.com/client/ELWSLBREU/...`
-3. The team ID is the part after `/client/` (e.g. `ELWSLBREU`)
+2. Look at the URL — it looks like: `https://app.slack.com/client/T0XXXXXXX/...`
+3. The team ID is the part after `/client/` (e.g. `T0XXXXXXX`)
 
 ### 2. Slack AI DM ID
 
 1. Open Slack → find **"Slack AI"** in your DMs sidebar
 2. Right-click "Slack AI" → **Copy link**
-3. You'll get something like: `https://your-org.slack.com/archives/D08S60Q238D`
+3. You'll get something like: `https://your-org.slack.com/archives/D0XXXXXXXX`
 4. The DM ID is the part after `/archives/` (starts with `D`)
 
 Both values are saved permanently in `~/.pi/slack-playwright-reader/config.json`.

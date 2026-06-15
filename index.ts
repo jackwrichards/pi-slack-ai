@@ -58,14 +58,12 @@ function setSlackAiDmId(id: string): void {
 }
 
 // Parse a team/workspace ID from a Slack URL or raw ID
-// Accepts: https://app.slack.com/client/ELWSLBREU/... or just ELWSLBREU
 function parseTeamId(input: string): string | null {
   const match = input.trim().match(/\/client\/([A-Z0-9]+)/) || input.trim().match(/^([A-Z0-9]{5,})$/);
   return match ? match[1] : null;
 }
 
 // Parse a DM ID from a Slack URL or raw ID
-// Accepts: https://...slack.com/archives/D08S60Q238D or just D08S60Q238D
 function parseDmId(input: string): string | null {
   const match = input.trim().match(/\/archives\/(D[A-Z0-9]+)/) || input.trim().match(/^(D[A-Z0-9]+)$/);
   return match ? match[1] : null;
@@ -74,7 +72,7 @@ function parseDmId(input: string): string | null {
 // Timing
 const MAX_WAIT_MS = 300000; // 5 minutes max wait for response
 const POLL_INTERVAL = 1000; // check every 1 second
-const STABLE_POLLS = 8; // response must be unchanged for 8 consecutive polls (8s) to be considered complete
+const STABLE_POLLS = 8; // response must be unchanged for 8 consecutive polls to be considered complete
 
 // ── Concurrency Lock ─────────────────────────────────────────────────────────
 
@@ -94,8 +92,16 @@ let activePage: Page | null = null;
 let isHeadless = true;
 
 async function getPage(): Promise<Page> {
-  if (browserContext && activePage && !activePage.isClosed()) {
-    return activePage;
+  // Check if existing context is still alive
+  if (browserContext && activePage) {
+    try {
+      await activePage.evaluate(() => true);
+      return activePage;
+    } catch {
+      // Page/context is dead — clean up and relaunch
+      browserContext = null;
+      activePage = null;
+    }
   }
 
   if (browserContext) {
@@ -125,16 +131,64 @@ async function relaunchVisible(): Promise<Page> {
   return getPage();
 }
 
-async function ensureSlackLoaded(page: Page, teamId: string): Promise<{ needsLogin: boolean }> {
+/**
+ * Check if the current page is actually authenticated and showing Slack.
+ * Returns a status describing the page state.
+ */
+async function checkPageAuth(page: Page): Promise<"authenticated" | "login_required" | "error" | "unknown"> {
   const url = page.url();
-  if (url.includes("app.slack.com/client/")) return { needsLogin: false };
 
-  await page.goto(`https://app.slack.com/client/${teamId}`, {
-    waitUntil: "load",
-    timeout: 60000,
-  });
+  // Obvious login/auth pages
+  if (url.includes("/login") || url.includes("/oauth") || url.includes("/sso") || url.includes("/auth") || url.includes("/signin")) {
+    return "login_required";
+  }
 
-  await page.waitForTimeout(3000);
+  // We're on a Slack client page — but is it actually loaded?
+  if (url.includes("app.slack.com/client/")) {
+    // Check for actual Slack UI elements that indicate we're authed
+    const hasWorkspace = await page.locator('[data-qa="channel_sidebar"], [data-qa="slack_kit_list"], .p-channel_sidebar').first().count().catch(() => 0);
+    if (hasWorkspace > 0) return "authenticated";
+
+    // Check for error states
+    const bodyText = await page.locator("body").innerText().catch(() => "");
+    if (bodyText.includes("trouble connecting") || bodyText.includes("couldn't load")) return "error";
+    if (bodyText.includes("sign in") || bodyText.includes("Sign In") || bodyText.includes("log in")) return "login_required";
+
+    // Page is on client URL but unclear state — give it a moment
+    return "unknown";
+  }
+
+  // About:blank or other non-Slack pages
+  if (url === "about:blank" || url === "") return "unknown";
+
+  // Redirected somewhere unexpected
+  return "login_required";
+}
+
+async function ensureSlackLoaded(page: Page, teamId: string): Promise<{ status: "authenticated" | "login_required" | "error" }> {
+  // If already on Slack and authenticated, skip navigation
+  const currentAuth = await checkPageAuth(page);
+  if (currentAuth === "authenticated") return { status: "authenticated" };
+
+  // Navigate to Slack
+  try {
+    await page.goto(`https://app.slack.com/client/${teamId}`, {
+      waitUntil: "domcontentloaded",
+      timeout: 30000,
+    });
+  } catch (e: any) {
+    return { status: "error" };
+  }
+
+  // Wait for page to settle — use smart waiting instead of hard timeout
+  try {
+    await page.waitForSelector(
+      '[data-qa="channel_sidebar"], [data-qa="slack_kit_list"], .p-channel_sidebar, [data-qa="login_email"]',
+      { timeout: 15000 }
+    );
+  } catch {
+    // Timeout waiting for known elements — check what we got
+  }
 
   // Handle desktop app redirect
   const bodyText = await page.locator("body").innerText().catch(() => "");
@@ -144,35 +198,83 @@ async function ensureSlackLoaded(page: Page, teamId: string): Promise<{ needsLog
       const href = await browserLink.getAttribute("href");
       if (href) {
         const baseUrl = new URL(page.url()).origin;
-        await page.goto(baseUrl + href, { waitUntil: "load", timeout: 60000 });
-        await page.waitForTimeout(5000);
+        await page.goto(baseUrl + href, { waitUntil: "domcontentloaded", timeout: 30000 });
+        // Wait for Slack to load after redirect
+        try {
+          await page.waitForSelector(
+            '[data-qa="channel_sidebar"], [data-qa="slack_kit_list"], .p-channel_sidebar',
+            { timeout: 15000 }
+          );
+        } catch {}
       }
     }
   }
 
-  // Check if login is needed
-  const currentUrl = page.url();
-  const needsLogin =
-    currentUrl.includes("/login") ||
-    currentUrl.includes("/oauth") ||
-    currentUrl.includes("/sso") ||
-    currentUrl.includes("/auth") ||
-    !currentUrl.includes("app.slack.com/client/");
+  // Final auth check
+  const finalAuth = await checkPageAuth(page);
+  if (finalAuth === "authenticated") return { status: "authenticated" };
+  if (finalAuth === "login_required") return { status: "login_required" };
 
-  return { needsLogin };
+  // Unknown state — try one more check after a brief wait
+  await page.waitForTimeout(2000);
+  const retryAuth = await checkPageAuth(page);
+  return { status: retryAuth === "authenticated" ? "authenticated" : "login_required" };
+}
+
+async function dismissModals(page: Page): Promise<void> {
+  // Dismiss any modal overlays that might be blocking interaction
+  // Try pressing Escape first (universal dismiss)
+  const modal = page.locator('.ReactModal__Overlay, [data-qa="modal"]').first();
+  if ((await modal.count()) > 0) {
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(500);
+  }
+
+  // Also try clicking close buttons on modals/dialogs
+  const closeBtn = page.locator('.ReactModal__Content [aria-label="Close"], .ReactModal__Content button:has-text("Close"), [data-qa="modal_close"]').first();
+  if ((await closeBtn.count()) > 0) {
+    await closeBtn.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
 }
 
 async function navigateToAIDM(page: Page, teamId: string, dmId: string): Promise<void> {
   const targetUrl = `https://app.slack.com/client/${teamId}/${dmId}`;
-  // Always navigate fresh to ensure we're on the home view, not inside a history item
-  await page.goto(targetUrl, { waitUntil: "load", timeout: 30000 });
-  await page.waitForTimeout(3000);
+  await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
-  // If we're inside a conversation, click "New conversation" to get back to fresh input
+  // Wait for message input to appear as signal the DM is loaded
+  try {
+    await page.waitForSelector(
+      '[data-qa="message_input"] [contenteditable="true"], .ql-editor[contenteditable="true"]',
+      { timeout: 10000 }
+    );
+  } catch {
+    // Input not found — might need "New conversation" button or page is broken
+  }
+
+  // Dismiss any modals/overlays blocking the page (e.g. "What's new" popups)
+  await dismissModals(page);
+
+  // Small settle time for any remaining renders
+  await page.waitForTimeout(500);
+
+  // If we're inside an existing conversation, click "New conversation" to get fresh input
   const newConvoBtn = page.locator('button:has-text("New conversation"), [aria-label="New conversation"]').first();
   if ((await newConvoBtn.count()) > 0) {
-    await newConvoBtn.click();
-    await page.waitForTimeout(2000);
+    // Use force:true to click even if something is partially overlapping
+    await newConvoBtn.click({ force: true }).catch(async () => {
+      // If still blocked, try Escape again and retry
+      await dismissModals(page);
+      await newConvoBtn.click({ force: true }).catch(() => {});
+    });
+    // Wait for input to reappear after clicking new conversation
+    try {
+      await page.waitForSelector(
+        '[data-qa="message_input"] [contenteditable="true"], .ql-editor[contenteditable="true"]',
+        { timeout: 5000 }
+      );
+    } catch {}
+    await page.waitForTimeout(500);
   }
 }
 
@@ -212,6 +314,42 @@ export default function (pi: ExtensionAPI): void {
       if (!id) { ctx.ui.notify(`Couldn't parse a DM ID from: "${input}"`, "error"); return; }
       setSlackAiDmId(id);
       ctx.ui.notify(`✅ Slack AI DM ID saved: ${id}`, "success");
+    },
+  });
+
+  // ── /slack-debug command ───────────────────────────────────────────────────
+  pi.registerCommand("slack-debug", {
+    description: "Open Slack in a visible browser to debug auth/connection issues",
+    handler: async (_args, ctx) => {
+      const teamId = getTeamId();
+      if (!teamId) {
+        ctx.ui.notify("No team ID configured. Use /slack-team-id first.", "error");
+        return;
+      }
+      ctx.ui.notify("Opening visible browser...", "info");
+      const page = await relaunchVisible();
+      await page.goto(`https://app.slack.com/client/${teamId}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+      ctx.ui.notify("Browser opened. Log in if needed, then close when done. Next ask_slack_ai call will use fresh session.", "success");
+    },
+  });
+
+  // ── /slack-headless command (toggle) ────────────────────────────────────────
+  pi.registerCommand("slack-headless", {
+    description: "Toggle headless/visible browser mode for Slack AI",
+    handler: async (_args, ctx) => {
+      isHeadless = !isHeadless;
+      // Kill existing browser so next call uses the new mode
+      if (browserContext) {
+        await browserContext.close().catch(() => {});
+        browserContext = null;
+        activePage = null;
+      }
+      ctx.ui.notify(
+        isHeadless
+          ? "👻 Headless mode ON — browser runs in background"
+          : "🔍 Visible mode ON — you can watch the browser window",
+        "success"
+      );
     },
   });
 
@@ -310,79 +448,136 @@ export default function (pi: ExtensionAPI): void {
         dmId = id;
       }
 
-      let page = await getPage();
-      onUpdate?.({ content: [{ type: "text", text: "Connecting to Slack..." }] });
-      const { needsLogin } = await ensureSlackLoaded(page, teamId);
+      // ── Launch browser & check auth ─────────────────────────────────────
+      onUpdate?.({ content: [{ type: "text", text: "🌐 Launching browser..." }] });
+
+      let page: Page;
+      try {
+        page = await getPage();
+      } catch (e: any) {
+        return { content: [{ type: "text", text: `Failed to launch browser: ${e.message}\n\nTry: npx playwright install chromium` }] };
+      }
+
+      onUpdate?.({ content: [{ type: "text", text: "🔐 Checking Slack authentication..." }] });
+      const { status } = await ensureSlackLoaded(page, teamId);
+
+      if (status === "error") {
+        return {
+          content: [{ type: "text", text: "Slack failed to load (network error or Slack is down). Try again or use /slack-debug to open a visible browser." }],
+        };
+      }
 
       // If login is needed, relaunch with visible browser
-      if (needsLogin) {
+      if (status === "login_required") {
+        onUpdate?.({ content: [{ type: "text", text: "🔑 Login required — opening visible browser..." }] });
         page = await relaunchVisible();
         await ensureSlackLoaded(page, teamId);
 
-        // Wait for user to log in (up to 5 min)
-        for (let i = 0; i < 60; i++) {
-          const url = page.url();
-          if (url.includes("app.slack.com/client/") && !url.includes("/login")) break;
-          await new Promise((r) => setTimeout(r, 5000));
+        // Wait for user to log in (up to 3 min)
+        const loginStart = Date.now();
+        const loginTimeout = 180000;
+        while (Date.now() - loginStart < loginTimeout) {
+          checkAbort();
+          const authStatus = await checkPageAuth(page);
+          if (authStatus === "authenticated") break;
+          const elapsed = Math.round((Date.now() - loginStart) / 1000);
+          onUpdate?.({ content: [{ type: "text", text: `🔑 Waiting for login... (${elapsed}s) — log in via the browser window` }] });
+          await sleep(3000);
+        }
+
+        // Verify we're actually logged in now
+        const finalCheck = await checkPageAuth(page);
+        if (finalCheck !== "authenticated") {
+          return {
+            content: [{ type: "text", text: "Login timed out (3 min). Use /slack-debug to open the browser and log in manually, then try again." }],
+          };
         }
 
         // Switch back to headless for future calls
         isHeadless = true;
+        onUpdate?.({ content: [{ type: "text", text: "✅ Logged in! Navigating to Slack AI..." }] });
       }
 
-      onUpdate?.({ content: [{ type: "text", text: "Opening Slack AI conversation..." }] });
-      await navigateToAIDM(page, teamId, dmId);
+      // ── Navigate to Slack AI DM ─────────────────────────────────────────
+      onUpdate?.({ content: [{ type: "text", text: "💬 Opening Slack AI DM..." }] });
 
-      // Check if Slack AI is still responding to a previous message
-      // Wait for any ongoing response to finish before sending a new one
-      let lastMsgText = "";
-      let prevStable = 0;
-      const preCheckStart = Date.now();
-
-      while (Date.now() - preCheckStart < 30000) {
-        checkAbort();
-        const lastMsg = page.locator('[data-qa="message_container"]').last();
-        if ((await lastMsg.count()) === 0) break;
-
-        const text = await lastMsg.evaluate((el) => {
-          const textEl = el.querySelector('[data-qa="message-text"], .c-message_kit__text');
-          return textEl ? textEl.textContent?.trim() || "" : el.textContent?.trim() || "";
-        }).catch(() => "");
-
-        if (text === lastMsgText) {
-          prevStable++;
-          if (prevStable >= 3) break; // stable for 9s, safe to send
-        } else {
-          lastMsgText = text;
-          prevStable = 0;
-        }
-        await sleep(POLL_INTERVAL);
+      try {
+        await navigateToAIDM(page, teamId, dmId);
+      } catch (e: any) {
+        return {
+          content: [{ type: "text", text: `Failed to navigate to Slack AI DM: ${e.message}\n\nCheck your DM ID with /slack-ai-dm or use /slack-debug.` }],
+        };
       }
 
-      // Count messages before sending
-      const beforeCount = await page.locator('[data-qa="message_container"]').count();
-
-      // Find message input and send
+      // Verify we can see the message input
       const messageInput = page.locator(
         '[data-qa="message_input"] [contenteditable="true"], ' +
         '.ql-editor[contenteditable="true"]'
       ).first();
 
       if ((await messageInput.count()) === 0) {
+        // Maybe auth expired mid-session or DM ID is wrong
+        const authNow = await checkPageAuth(page);
+        if (authNow !== "authenticated") {
+          // Clear browser context so next attempt relaunches fresh
+          await browserContext?.close().catch(() => {});
+          browserContext = null;
+          activePage = null;
+          return {
+            content: [{ type: "text", text: "Session expired — Slack is no longer authenticated. Will show login browser on next attempt. Try again." }],
+          };
+        }
         return {
-          content: [{ type: "text", text: "Could not find message input. Slack may need re-login — will show browser on next attempt." }],
+          content: [{ type: "text", text: "Could not find message input in Slack AI DM. The DM ID may be wrong — use /slack-ai-dm to reconfigure, or /slack-debug to inspect." }],
         };
       }
 
+      // ── Quick pre-check: is Slack AI still responding to a previous msg? ──
+      onUpdate?.({ content: [{ type: "text", text: "📋 Checking for prior responses..." }] });
+
+      const beforeCount = await page.locator('[data-qa="message_container"]').count();
+
+      // Only wait if there are existing messages and the last one might still be streaming
+      if (beforeCount > 0) {
+        const lastMsg = page.locator('[data-qa="message_container"]').last();
+        let lastText = await lastMsg.evaluate((el) => {
+          const textEl = el.querySelector('[data-qa="message-text"], .c-message_kit__text');
+          return textEl ? textEl.textContent?.trim() || "" : "";
+        }).catch(() => "");
+
+        // Quick stability check — max 6 seconds (much shorter than before)
+        let stable = 0;
+        for (let i = 0; i < 6; i++) {
+          checkAbort();
+          await sleep(1000);
+          const currentText = await lastMsg.evaluate((el) => {
+            const textEl = el.querySelector('[data-qa="message-text"], .c-message_kit__text');
+            return textEl ? textEl.textContent?.trim() || "" : "";
+          }).catch(() => "");
+
+          if (currentText === lastText) {
+            stable++;
+            if (stable >= 2) break; // Stable for 2s — good enough
+          } else {
+            lastText = currentText;
+            stable = 0;
+            onUpdate?.({ content: [{ type: "text", text: "⏳ Previous response still streaming, waiting..." }] });
+          }
+        }
+      }
+
+      // ── Send the question ───────────────────────────────────────────────
+      onUpdate?.({ content: [{ type: "text", text: "✏️ Typing question..." }] });
+
       await messageInput.click();
-      await sleep(300);
+      await sleep(200);
       await messageInput.fill(params.question);
-      await sleep(500);
+      await sleep(300);
       await page.keyboard.press("Enter");
 
-      onUpdate?.({ content: [{ type: "text", text: "✉️ Sent to Slack AI, waiting for response..." }] });
+      onUpdate?.({ content: [{ type: "text", text: "✉️ Sent! Waiting for Slack AI response..." }] });
 
-      // Wait for response — poll until it stabilizes (stops streaming)
+      // ── Wait for response — poll until it stabilizes ────────────────────
       let response = "";
       let lastResponseText = "";
       let stableCount = 0;
@@ -397,17 +592,20 @@ export default function (pi: ExtensionAPI): void {
         // No new messages yet — AI hasn't started responding
         if (afterCount <= beforeCount) {
           const waitElapsed = Math.round((Date.now() - startTime) / 1000);
-          onUpdate?.({ content: [{ type: "text", text: `⏳ Waiting for Slack AI to respond... (${waitElapsed}s)` }] });
+          onUpdate?.({ content: [{ type: "text", text: `⏳ Waiting for Slack AI to start responding... (${waitElapsed}s)` }] });
+
+          // If we've been waiting too long for even a first response, something is wrong
+          if (waitElapsed > 30) {
+            onUpdate?.({ content: [{ type: "text", text: `⚠️ No response after ${waitElapsed}s — Slack AI may be slow or the message didn't send` }] });
+          }
           continue;
         }
 
-        // Get the last message — extract just the AI's response text, not metadata
+        // Get the last message
         const lastMsg = page.locator('[data-qa="message_container"]').last();
         const text = await lastMsg.evaluate((el) => {
-          // Try to get just the message body text, skipping sender/time/action labels
           const textEl = el.querySelector('[data-qa="message-text"], .c-message_kit__text');
           if (textEl) return textEl.textContent?.trim() || "";
-          // Fallback: get full container but skip known metadata elements
           const clone = el.cloneNode(true) as HTMLElement;
           clone.querySelectorAll('[data-qa="message_sender_name"], .c-message__sender, .c-timestamp, time').forEach(e => e.remove());
           return clone.textContent?.trim() || "";
@@ -427,7 +625,7 @@ export default function (pi: ExtensionAPI): void {
             break;
           }
         } else {
-          // Response is still growing — report progress
+          // Response is still growing
           lastResponseText = text;
           stableCount = 0;
           const elapsed = Math.round((Date.now() - startTime) / 1000);
@@ -449,24 +647,26 @@ export default function (pi: ExtensionAPI): void {
           response = text + "\n\n[Note: Response may be incomplete — timed out after 5 minutes]";
         } else {
           return {
-            content: [{ type: "text", text: "Timed out waiting for Slack AI response (5 min). Try again — the AI may be slow or the DM needs attention." }],
+            content: [{ type: "text", text: "Timed out waiting for Slack AI response (5 min). The AI may be unresponsive. Try /slack-debug to check the browser state." }],
           };
         }
       }
 
-      // Clean up response — strip metadata cruft
+      // Clean up response
       response = response
-        .replace(/^Slackbot\s+.*?\n/i, "") // Remove "Slackbot  Just now" line
-        .replace(/^.*?(Searched|Looked up|Retrieved|Browsing|Searching|Reading|Found|Checking|Reviewed|Summariz|Looked at|Pulled up|Queried|Fetched|Scanned).*?\n/i, "") // Remove action labels
-        .replace(/\s+\d+$/gm, "") // Remove trailing reference numbers like " 1"
+        .replace(/^Slackbot\s+.*?\n/i, "")
+        .replace(/^.*?(Searched|Looked up|Retrieved|Browsing|Searching|Reading|Found|Checking|Reviewed|Summariz|Looked at|Pulled up|Queried|Fetched|Scanned).*?\n/i, "")
+        .replace(/\s+\d+$/gm, "")
         .trim();
+
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
 
       return {
         content: [{ type: "text", text: response }],
         details: {
           question: params.question,
           chars: response.length,
-          elapsed: Math.round((Date.now() - startTime) / 1000),
+          elapsed,
         },
       };
       }); // end withLock
