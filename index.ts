@@ -145,16 +145,23 @@ async function checkPageAuth(page: Page): Promise<"authenticated" | "login_requi
 
   // We're on a Slack client page — but is it actually loaded?
   if (url.includes("app.slack.com/client/")) {
-    // Check for actual Slack UI elements that indicate we're authed
-    const hasWorkspace = await page.locator('[data-qa="channel_sidebar"], [data-qa="slack_kit_list"], .p-channel_sidebar').first().count().catch(() => 0);
-    if (hasWorkspace > 0) return "authenticated";
-
-    // Check for error states
+    // Check for error/login states first
     const bodyText = await page.locator("body").innerText().catch(() => "");
     if (bodyText.includes("trouble connecting") || bodyText.includes("couldn't load")) return "error";
-    if (bodyText.includes("sign in") || bodyText.includes("Sign In") || bodyText.includes("log in")) return "login_required";
+    if (bodyText.includes("sign in") || bodyText.includes("Sign In") || bodyText.includes("log in") || bodyText.includes("Sign in")) return "login_required";
 
-    // Page is on client URL but unclear state — give it a moment
+    // Check for known Slack UI elements that indicate we're authed
+    const hasUI = await page.locator(
+      '[data-qa="channel_sidebar"], [data-qa="slack_kit_list"], .p-channel_sidebar, ' +
+      '[data-qa="message_input"], [data-qa="messsage_input"], .p-workspace__primary_view, ' +
+      '[data-qa="top_nav"], .p-top_nav, [data-qa="channel_header"]'
+    ).first().count().catch(() => 0);
+    if (hasUI > 0) return "authenticated";
+
+    // On client URL with no login indicators — likely authenticated but still loading
+    // If body has substantial content (not a blank loading page), treat as authenticated
+    if (bodyText.length > 200) return "authenticated";
+
     return "unknown";
   }
 
@@ -487,7 +494,7 @@ export default function (pi: ExtensionAPI): void {
 
         // Verify we're actually logged in now
         const finalCheck = await checkPageAuth(page);
-        if (finalCheck !== "authenticated") {
+        if (finalCheck === "login_required" || finalCheck === "error") {
           return {
             content: [{ type: "text", text: "Login timed out (3 min). Use /slack-debug to open the browser and log in manually, then try again." }],
           };
